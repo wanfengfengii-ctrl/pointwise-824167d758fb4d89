@@ -1,0 +1,14 @@
+[
+  {
+    "batch_id": "B1",
+    "revisions": [{"station": "A", "day": "2026-01-15", "revision": "r1", "mode": "initial", "state": "reading", "liters": 7, "origin": {"document": "meter-B1", "row": 1}}]
+  },
+  {
+    "batch_id": "B2",
+    "revisions": [{"station": "A", "day": "2026-01-15", "revision": "r2", "mode": "correction", "previous": "r1", "state": "reading", "liters": 18, "origin": {"document": "meter-B2", "row": 2}}]
+  },
+  {
+    "batch_id": "B3",
+    "revisions": [{"station": "A", "day": "2026-01-15", "revision": "r3", "mode": "correction", "previous": "r2", "state": "reading", "liters": 14, "origin": {"document": "meter-B3", "row": 3}}]
+  }
+]
