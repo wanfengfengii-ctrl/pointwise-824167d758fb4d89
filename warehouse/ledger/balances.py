@@ -69,13 +69,30 @@ def apply_deltas(balances: tuple[StationDayBalance, ...],
     return tuple(by_key[key] for key in sorted(by_key))
 
 
+def apply_move(balances: tuple[StationDayBalance, ...], move) -> tuple[StationDayBalance, ...]:
+    by_key = {balance.key: balance for balance in balances}
+    source_current = by_key.get(move.source.key)
+    if source_current is None:
+        raise ValueError(f'move source {move.source.key!r} has no balance to transfer')
+    if (source_current.revision, source_current.state, source_current.liters) != (
+            move.source.revision, move.state, move.liters):
+        raise ValueError(f'move source does not match the current balance for {move.source.key!r}')
+    if move.target.key in by_key:
+        raise ValueError(f'move target {move.target.key!r} is not vacant')
+    del by_key[move.source.key]
+    by_key[move.target.key] = StationDayBalance(
+        *move.target.key, move.target.revision, move.state, move.liters)
+    return tuple(by_key[key] for key in sorted(by_key))
+
+
 def save_balances(connection: Connection, subscription: str,
                   balances: tuple[StationDayBalance, ...]) -> None:
+    # Rewrite the whole subscription row set so a station-day vacated by a move
+    # loses its balance entry instead of keeping the old liters behind.
+    connection.execute('DELETE FROM balances WHERE subscription = ?', (subscription,))
     connection.executemany('''
         INSERT INTO balances (subscription, station, day, revision, state, liters)
         VALUES (?, ?, ?, ?, ?, ?)
-        ON CONFLICT (subscription, station, day) DO UPDATE SET
-            revision = excluded.revision, state = excluded.state, liters = excluded.liters
     ''', [(subscription, *value.key, value.revision, value.state,
            None if value.liters is None else str(value.liters)) for value in balances])
 

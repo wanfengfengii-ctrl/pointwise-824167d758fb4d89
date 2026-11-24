@@ -76,3 +76,109 @@ def read(ledger, subscription: str, checkpoint_id: str) -> CheckpointView:
         checkpoint = load_checkpoint(connection, subscription, checkpoint_id)
         history = read_history_prefix(connection, subscription, checkpoint.sequence)
     return CheckpointView(checkpoint, history)
+
+
+def _ref_dict(ref) -> dict:
+    return {'station': ref.station, 'day': ref.day, 'revision': ref.revision}
+
+
+def _ref_matches(ref, station, day, revision) -> bool:
+    return ref.station == station and ref.day == day and ref.revision == revision
+
+
+def trace(ledger, subscription: str, checkpoint_id: str,
+          station: str, day: str, revision: str) -> dict:
+    """Reconstruct the full revision chain visible at a checkpoint.
+
+    Every node is one revision occurrence (initial, correction or move).
+    Corrections chain within a station-day; moves chain the source revision to
+    the new target revision. The queried revision may have been superseded or
+    moved away, as long as it was visible in the prefix history.
+    """
+    with ledger_transaction(ledger, write=False) as connection:
+        checkpoint = load_checkpoint(connection, subscription, checkpoint_id)
+        history = read_history_prefix(connection, subscription, checkpoint.sequence)
+
+    # Stable node ids use the precise revision reference; edges use the same ids.
+    nodes = {}
+    edges = []
+    queried_id = None
+
+    def remember(node) -> tuple:
+        node_id = (node['ref']['station'], node['ref']['day'], node['ref']['revision'])
+        nodes[node_id] = node
+        return node_id
+
+    for posted in history:
+        if posted.move_order is not None:
+            move = posted.move_order
+            source_id = (*move.source.key, move.source.revision)
+            if source_id not in nodes:
+                raise RuntimeError(
+                    f'history for {subscription!r} is missing move source {move.source.key!r}')
+            target_node = {
+                'batch_id': posted.batch_id, 'sequence': posted.sequence,
+                'ref': move.target.as_dict(), 'kind': 'move',
+                'state': move.state, 'liters': move.liters,
+                'origin': {'document': move.origin.document, 'row': move.origin.row},
+            }
+            target_id = remember(target_node)
+            edges.append((source_id, target_id))
+            if _ref_matches(move.source, station, day, revision):
+                queried_id = source_id
+            if _ref_matches(move.target, station, day, revision):
+                queried_id = target_id
+            continue
+        for delta in posted.deltas:
+            after = delta.after
+            entry = {
+                'batch_id': posted.batch_id, 'sequence': posted.sequence,
+                'ref': _ref_dict(after),
+                'kind': 'move' if after.mode == 'move' else after.mode,
+                'state': after.state,
+                'liters': None if after.liters is None else after.liters,
+                'origin': {'document': after.origin.document, 'row': after.origin.row},
+            }
+            node_id = remember(entry)
+            if delta.before is not None:
+                before_id = (*delta.before.key, delta.before.revision)
+                if before_id not in nodes:
+                    raise RuntimeError(
+                        f'history for {subscription!r} is missing predecessor '
+                        f'{delta.before.key!r}')
+                edges.append((before_id, node_id))
+            if _ref_matches(after, station, day, revision):
+                queried_id = node_id
+
+    if queried_id is None:
+        raise KeyError(
+            f'revision {(station, day, revision)!r} is not visible at checkpoint '
+            f'{checkpoint_id!r} for subscription {subscription!r}')
+
+    successors = dict(edges)
+    predecessors = {target: source for source, target in edges}
+    if len(predecessors) != len(edges):
+        raise RuntimeError('revision history contains a converging chain')
+
+    current_id = queried_id
+    guard = set()
+    while current_id in successors:
+        if current_id in guard:
+            raise RuntimeError('revision history contains a cycle')
+        guard.add(current_id)
+        current_id = successors[current_id]
+
+    chain_ids = []
+    cursor = current_id
+    guard = set()
+    while cursor is not None:
+        if cursor in guard:
+            raise RuntimeError('revision history contains a cycle')
+        guard.add(cursor)
+        chain_ids.append(cursor)
+        cursor = predecessors.get(cursor)
+
+    public_keys = ('batch_id', 'sequence', 'ref', 'kind', 'state', 'liters', 'origin')
+    chain = [{key: nodes[node_id][key] for key in public_keys}
+             for node_id in reversed(chain_ids)]
+    return {'current': dict(nodes[current_id]['ref']), 'history': chain}

@@ -1,6 +1,6 @@
 from dataclasses import dataclass
 
-from warehouse.ledger.balances import apply_deltas, load_balances, save_balances
+from warehouse.ledger.balances import apply_deltas, apply_move, load_balances, save_balances
 from warehouse.ledger.checkpoints import Checkpoint, load_checkpoint, save_checkpoint
 from warehouse.ledger.history import PostedBatch, append_posted_batch, find_posted_batch
 from warehouse.ledger.store import ledger_transaction
@@ -40,18 +40,23 @@ def post(relay, ledger, subscription: str, *, delivery: RelayEntry | None = None
         current = _require_subscription(connection, subscription)
         batch = find_posted_batch(connection, subscription, entry.batch_id)
         if batch is not None:
-            if (batch.sequence, batch.deltas) != (entry.sequence, entry.deltas):
+            if (batch.sequence, batch.deltas, batch.move_order) != (
+                    entry.sequence, entry.deltas, entry.move_order):
                 raise ValueError('replayed delivery does not match the original posting')
             checkpoint = load_checkpoint(connection, subscription, batch.checkpoint_id)
             status = 'replayed'
         else:
             if entry != offered or entry.sequence != current.sequence + 1:
                 raise ValueError('delivery is not the next official batch for this subscription')
-            balances = apply_deltas(load_balances(connection, subscription), entry.deltas)
+            balances = load_balances(connection, subscription)
+            if entry.move_order is not None:
+                balances = apply_move(balances, entry.move_order)
+            else:
+                balances = apply_deltas(balances, entry.deltas)
             checkpoint = Checkpoint(subscription, f'C{entry.sequence}', entry.sequence,
                                     entry.batch_id, balances)
             batch = PostedBatch(subscription, entry.sequence, entry.batch_id,
-                                checkpoint.checkpoint_id, entry.deltas)
+                                checkpoint.checkpoint_id, entry.deltas, entry.move_order)
             save_balances(connection, subscription, balances)
             save_checkpoint(connection, checkpoint)
             append_posted_batch(connection, batch)

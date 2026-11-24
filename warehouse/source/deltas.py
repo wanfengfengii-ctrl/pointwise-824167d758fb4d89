@@ -34,8 +34,8 @@ def encode_deltas(entries: tuple[DeltaEntry, ...]) -> str:
 def decode_deltas(body: str) -> tuple[DeltaEntry, ...]:
     entries = []
     for item in json.loads(body):
-        before = None if item['before'] is None else parse_revision(item['before'])
-        after = parse_revision(item['after'])
+        before = None if item['before'] is None else parse_revision(item['before'], stored=True)
+        after = parse_revision(item['after'], stored=True)
         liters_delta = item['liters_delta']
         if type(liters_delta) is not int:
             raise ValueError('stored delta is not an integer')

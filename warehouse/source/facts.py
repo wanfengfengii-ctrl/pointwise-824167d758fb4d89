@@ -33,7 +33,7 @@ class RevisionChange:
     after: StationDayRevision
 
 
-def parse_revision(value) -> StationDayRevision:
+def parse_revision(value, *, stored: bool = False) -> StationDayRevision:
     required = {'station', 'day', 'revision', 'mode', 'state', 'liters', 'origin'}
     if not isinstance(value, Mapping) or not required <= value.keys():
         raise ValueError('incomplete station-day revision')
@@ -48,7 +48,12 @@ def parse_revision(value) -> StationDayRevision:
     if previous is not None:
         previous = require_text(previous, 'previous')
     mode = value['mode']
-    if mode not in ('initial', 'correction') or (mode == 'initial' and previous is not None):
+    allowed = ('initial', 'correction', 'move') if stored else ('initial', 'correction')
+    # 'move' only appears on facts reconstructed from stored move evidence;
+    # published revision input only accepts initial/correction.
+    if mode not in allowed or (mode == 'initial' and previous is not None):
+        raise ValueError('invalid revision mode or predecessor')
+    if mode == 'move' and previous is not None:
         raise ValueError('invalid revision mode or predecessor')
     state = value['state']
     liters = value['liters']
@@ -85,25 +90,54 @@ def initialize_facts(connection: Connection) -> None:
 
 def load_current_revision(connection: Connection, station: str,
                           day: str) -> StationDayRevision | None:
-    row = connection.execute('''
-        SELECT body FROM station_revisions WHERE station = ? AND day = ?
+    # Imported lazily so the move ledger can reuse the revision parser without a
+    # circular module dependency.
+    from warehouse.source.moves import find_move_event
+
+    revision_row = connection.execute('''
+        SELECT sequence, position, body FROM station_revisions
+        WHERE station = ? AND day = ?
         ORDER BY sequence DESC, position DESC LIMIT 1
     ''', (station, day)).fetchone()
-    return None if row is None else parse_revision(json.loads(row[0]))
+    incoming_row = connection.execute('''
+        SELECT sequence, position, target_revision, state, liters,
+               origin_document, origin_row
+        FROM station_move_events
+        WHERE target_station = ? AND target_day = ?
+        ORDER BY sequence DESC, position DESC LIMIT 1
+    ''', (station, day)).fetchone()
+    outgoing = find_move_event(connection, station, day)
+    revision_order = None if revision_row is None else (revision_row[0], revision_row[1])
+    incoming_order = None if incoming_row is None else (incoming_row[0], incoming_row[1])
+    outgoing_order = None if outgoing is None else (outgoing[0], outgoing[1])
+    orders = [order for order in (revision_order, incoming_order, outgoing_order)
+              if order is not None]
+    if not orders:
+        return None
+    newest_order = max(orders)
+    if newest_order == outgoing_order:
+        # The newest event vacated this station-day.
+        return None
+    if incoming_order is not None and newest_order == incoming_order:
+        (_, _, target_revision, state, liters, document, origin_row) = incoming_row
+        return StationDayRevision(station, day, target_revision, 'move', state,
+                                  None if liters is None else int(liters),
+                                  Origin(document, origin_row), None)
+    return parse_revision(json.loads(revision_row[2]), stored=True)
 
 
 def resolve_revisions(connection: Connection,
                       revisions: tuple[StationDayRevision, ...]) -> tuple[RevisionChange, ...]:
+    from warehouse.source.moves import revision_used_anywhere
+
     current = {}
     seen = set()
     changes = []
     for revision in revisions:
         key = revision.key
         identity = (*key, revision.revision)
-        existing = connection.execute('''
-            SELECT 1 FROM station_revisions WHERE station = ? AND day = ? AND revision = ?
-        ''', identity).fetchone()
-        if identity in seen or existing is not None:
+        existing = revision_used_anywhere(connection, *identity)
+        if identity in seen or existing:
             raise ValueError(f'revision id already used for station-day {key!r}')
         if key not in current:
             current[key] = load_current_revision(connection, *key)
